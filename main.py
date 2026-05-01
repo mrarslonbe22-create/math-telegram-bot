@@ -37,7 +37,6 @@ dp = Dispatcher(storage=MemoryStorage())
 
 # Foydalanuvchilarning test jarayoni uchun vaqtincha ma'lumotlar
 user_test_data = {}  # user_id: {...}
-user_timer_tasks = {}  # user_id: asyncio.Task
 
 # ==================== ADMIN TEKSHIRUV FUNKSIYASI ====================
 
@@ -379,58 +378,10 @@ def generate_standard_questions():
     random.shuffle(questions)
     return questions
 
-# ==================== TIMER BOSHQARISH ====================
-
-async def cancel_timer(user_id: int):
-    """Foydalanuvchi uchun taymerni bekor qilish"""
-    if user_id in user_timer_tasks:
-        task = user_timer_tasks[user_id]
-        if not task.done():
-            task.cancel()
-        del user_timer_tasks[user_id]
-
-async def start_timer(user_id: int, message: Message, question_index: int):
-    """Yangi taymer boshlash"""
-    # Avval eski taymerni bekor qilish
-    await cancel_timer(user_id)
-    
-    # Yangi taymer yaratish
-    task = asyncio.create_task(timeout_callback(user_id, message, question_index))
-    user_timer_tasks[user_id] = task
-
-async def timeout_callback(user_id: int, message: Message, question_index: int):
-    """60 soniyadan keyin avtomatik keyingi savolga o'tish"""
-    await asyncio.sleep(60)
-    
-    # Tekshirish: foydalanuvchi hali testda va shu savolda
-    if user_id not in user_test_data:
-        return
-    
-    data = user_test_data[user_id]
-    
-    # Agar savol o'zgargan bo'lsa yoki javob berilgan bo'lsa, hech narsa qilma
-    if data["current_q"] != question_index:
-        return
-    
-    if len(data["answers"]) > question_index:
-        return
-    
-    # Javob berilmagan -> 0 ball
-    data["answers"].append(0)
-    data["current_q"] += 1
-    
-    try:
-        await message.answer("⏰ **Vaqt tugadi! Javob berilmadi.** Keyingi savol...", parse_mode="Markdown")
-    except:
-        pass
-    
-    # Keyingi savolga o'tish
-    await send_question(message, user_id)
-
 # ==================== SAVOL YUBORISH FUNKSIYASI ====================
 
 async def send_question(message: Message, user_id: int):
-    """Savol yuborish va taymer boshlash"""
+    """Savol yuborish"""
     if user_id not in user_test_data:
         return
     
@@ -439,8 +390,6 @@ async def send_question(message: Message, user_id: int):
     
     # Test tugaganmi?
     if q_index >= len(data["questions"]):
-        await cancel_timer(user_id)
-        
         end_time = time.time()
         time_spent = int(end_time - data["start_time"])
         correct_count = sum(data["answers"])
@@ -448,10 +397,15 @@ async def send_question(message: Message, user_id: int):
         # Xato qilingan savollarni tahlil qilish
         wrong_answers = analyze_answers(data["questions"], data["answers"])
         
+        # Vaqtni hisoblash (daqiqa:sekund)
+        minutes = time_spent // 60
+        seconds = time_spent % 60
+        time_str = f"{minutes} daqiqa {seconds} sekund" if minutes > 0 else f"{seconds} sekund"
+        
         # Natija xabari
         result_text = f"✅ **Test tugadi!**\n\n"
         result_text += f"📊 **To'g'ri javoblar:** {correct_count}/{len(data['questions'])}\n"
-        result_text += f"⏱ **Sarflangan vaqt:** {time_spent} sekund\n"
+        result_text += f"⏱ **Umumiy vaqt:** {time_str}\n"
         result_text += f"📈 **Natija:** {int(correct_count/len(data['questions'])*100)}%\n\n"
         
         if wrong_answers:
@@ -487,16 +441,12 @@ async def send_question(message: Message, user_id: int):
     remaining = len(data["questions"]) - q_index
     
     text = f"❓ **Savol {q_index+1}/{len(data['questions'])}**\n"
-    text += f"⏰ Vaqt: 60 soniya\n"
     text += f"📋 Qolgan savollar: {remaining}\n\n"
     text += f"{q_data['question']}"
     
     try:
         msg = await message.answer(text, parse_mode="Markdown", reply_markup=option_buttons(q_data["options"]))
         data["message_id"] = msg.message_id
-        
-        # Taymer boshlash
-        await start_timer(user_id, message, q_index)
     except Exception as e:
         print(f"Xatolik: {e}")
 
@@ -508,7 +458,8 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
         "🤖 **Assalomu alaykum! Matematika botiga xush kelibsiz!**\n\n"
         "📚 Bu bot sizning matematika bilimingizni oshirish uchun yaratilgan.\n"
-        "⏰ Har bir test 30 ta savoldan iborat va har bir savolga 60 soniya vaqtingiz bor.\n\n"
+        "📋 Har bir test 30 ta savoldan iborat.\n"
+        "📊 Test tugagach, natijalaringiz va xato savollaringiz ko'rsatiladi.\n\n"
         "📝 **Iltimos, ismingizni kiriting:**",
         parse_mode="Markdown"
     )
@@ -546,7 +497,6 @@ async def start_test(message: Message):
     
     # Agar oldingi test mavjud bo'lsa, tozalash
     if user_id in user_test_data:
-        await cancel_timer(user_id)
         del user_test_data[user_id]
     
     questions = generate_standard_questions()
@@ -562,9 +512,8 @@ async def start_test(message: Message):
     await message.answer(
         "🎯 **Test boshlandi!**\n\n"
         "📋 Jami 30 ta savol\n"
-        "⏰ Har bir savolga 60 soniya vaqt\n"
         "✅ Javob berish uchun tugmalardan birini bosing\n"
-        "⏱ Javob bermasangiz, avtomatik keyingi savolga o'tadi\n\n"
+        "📊 Test tugagach, natijalaringiz va xato savollaringiz ko'rsatiladi\n\n"
         "**Omad!** 🍀",
         parse_mode="Markdown"
     )
@@ -619,10 +568,14 @@ async def show_personal_results(message: Message):
     
     text = "📊 **SIZNING SHAXSIY NATIJALARINGIZ**\n\n"
     for i, (test_name, correct, time_spent, date) in enumerate(results, 1):
+        minutes = time_spent // 60
+        seconds = time_spent % 60
+        time_str = f"{minutes} daqiqa {seconds} sekund" if minutes > 0 else f"{seconds} sekund"
+        
         text += f"**{i}.** 📅 {date[:10]}\n"
         text += f"   📚 {test_name}\n"
         text += f"   ✅ To'g'ri: {correct} ta\n"
-        text += f"   ⏱ Vaqt: {time_spent} sekund\n\n"
+        text += f"   ⏱ Vaqt: {time_str}\n\n"
     
     text += "\n🗑 **Natijalarni tozalash** uchun /clear_results yuboring."
     
@@ -651,9 +604,13 @@ async def show_daily_ranking(message: Message):
     text = "🏆 **BUGUNGI KUNNING ENG YAXSHI NATIJALARI** 🏆\n\n"
     for idx, (first_name, last_name, correct, time_spent) in enumerate(ranking[:20], 1):
         medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"{idx}."
-        text += f"{medal} {first_name} {last_name}\n"
+        minutes = time_spent // 60
+        seconds = time_spent % 60
+        time_str = f"{minutes} daqiqa {seconds} sekund" if minutes > 0 else f"{seconds} sekund"
+        
+        text += f"{medal} **{first_name} {last_name}**\n"
         text += f"   ✅ {correct} ta to'g'ri\n"
-        text += f"   ⏱ {time_spent} sekund\n\n"
+        text += f"   ⏱ {time_str}\n\n"
     
     await message.answer(text, parse_mode="Markdown")
 
@@ -780,7 +737,6 @@ async def start_custom_test(callback: CallbackQuery):
     
     # Agar oldingi test mavjud bo'lsa, tozalash
     if user_id in user_test_data:
-        await cancel_timer(user_id)
         del user_test_data[user_id]
     
     user_test_data[user_id] = {
@@ -796,7 +752,7 @@ async def start_custom_test(callback: CallbackQuery):
     await callback.message.answer(
         f"🎯 **Test boshlandi: {name}**\n\n"
         f"📚 Jami savollar: {len(questions)} ta\n"
-        f"⏰ Har bir savolga 60 soniya vaqt\n\n"
+        f"✅ Javob berish uchun tugmalardan birini bosing\n\n"
         f"**Omad!** 🍀",
         parse_mode="Markdown"
     )
@@ -894,7 +850,10 @@ async def admin_get_full_stats(message: Message):
     
     text += "\n📊 **ENG YAXSHI NATIJALAR**\n\n"
     for idx, (first, last, correct, time_spent, date) in enumerate(top_results, 1):
-        text += f"{idx}. {first} {last} → ✅ {correct} ta ⏱ {time_spent} sek (📅 {date[:10]})\n"
+        minutes = time_spent // 60
+        seconds = time_spent % 60
+        time_str = f"{minutes} min {seconds} sek" if minutes > 0 else f"{seconds} sek"
+        text += f"{idx}. {first} {last} → ✅ {correct} ta ⏱ {time_str} (📅 {date[:10]})\n"
     
     await message.answer(text, parse_mode="Markdown")
 
