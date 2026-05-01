@@ -11,10 +11,11 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, CallbackQuery, BotCommand
+from aiogram.exceptions import TelegramBadRequest
 
 from config import BOT_TOKEN, ADMIN_ID
 from database import *
-from states import RegisterState, AddTestState
+from states import RegisterState, AddTestState, TestState
 from keyboards import *
 
 # Flask app (Render uchun keep-alive)
@@ -36,7 +37,8 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 # Foydalanuvchilarning test jarayoni uchun vaqtincha ma'lumotlar
-user_test_data = {}
+user_test_data = {}  # user_id: {...}
+user_timer_tasks = {}  # user_id: asyncio.Task
 
 # ==================== ADMIN TEKSHIRUV FUNKSIYASI ====================
 
@@ -50,8 +52,6 @@ async def setup_admin_commands():
         BotCommand(command="stat", description="📊 Bot statistikasi"),
         BotCommand(command="users_count", description="👥 Foydalanuvchilar soni"),
         BotCommand(command="broadcast", description="📢 Xabar tarqatish"),
-        BotCommand(command="set_bot_name", description="✏️ Bot nomini o'zgartirish"),
-        BotCommand(command="set_bot_desc", description="📝 Bot tavsifini o'zgartirish"),
         BotCommand(command="clear_daily", description="🗑 Kunlik natijalarni tozalash"),
         BotCommand(command="get_stats", description="📈 Eng yaxshi natijalar"),
         BotCommand(command="export_users", description="📤 Foydalanuvchilarni eksport qilish"),
@@ -103,6 +103,22 @@ async def get_top_results():
     data = c.fetchall()
     conn.close()
     return data
+
+# ==================== JAVOBLARNI TAHLLI QILISH ====================
+
+def analyze_answers(questions, user_answers):
+    """Xato qilingan savollarni tahlil qilish"""
+    wrong_answers = []
+    for i, (q, user_ans) in enumerate(zip(questions, user_answers)):
+        if user_ans != q["correct"]:
+            correct_text = q["options"][q["correct"]]
+            wrong_answers.append({
+                "num": i + 1,
+                "question": q["question"],
+                "user_choice": q["options"][user_ans] if user_ans < len(q["options"]) else "Javob berilmagan",
+                "correct": correct_text
+            })
+    return wrong_answers
 
 # ==================== STANDART 30 TA SAVOL ====================
 
@@ -363,18 +379,127 @@ def generate_standard_questions():
     random.shuffle(questions)
     return questions
 
+# ==================== SAVOL YUBORISH FUNKSIYASI (TIMER BILAN) ====================
+
+async def cancel_timer(user_id: int):
+    """Foydalanuvchi uchun taymerni bekor qilish"""
+    if user_id in user_timer_tasks:
+        task = user_timer_tasks[user_id]
+        if not task.done():
+            task.cancel()
+        del user_timer_tasks[user_id]
+
+async def timeout_callback(user_id: int, message: Message, question_index: int):
+    """60 soniyadan keyin avtomatik keyingi savolga o'tish"""
+    await asyncio.sleep(60)
+    
+    if user_id not in user_test_data:
+        return
+    
+    data = user_test_data[user_id]
+    # Agar hali o'sha savol bo'lsa (javob berilmagan)
+    if data["current_q"] == question_index and len(data["answers"]) == question_index:
+        data["answers"].append(0)  # Noto'g'ri deb hisobla
+        data["current_q"] += 1
+        
+        try:
+            await message.answer("⏰ **Vaqt tugadi! Javob berilmadi.**", parse_mode="Markdown")
+        except:
+            pass
+        
+        await send_question(message, user_id)
+
+async def send_question(message: Message, user_id: int):
+    """Savol yuborish va taymer boshlash"""
+    if user_id not in user_test_data:
+        return
+    
+    data = user_test_data[user_id]
+    q_index = data["current_q"]
+    
+    if q_index >= len(data["questions"]):
+        # Test tugadi
+        await cancel_timer(user_id)
+        
+        end_time = time.time()
+        time_spent = int(end_time - data["start_time"])
+        correct_count = sum(data["answers"])
+        
+        # Xato qilingan savollarni tahlil qilish
+        wrong_answers = analyze_answers(data["questions"], data["answers"])
+        
+        # Natija xabari
+        result_text = f"✅ **Test tugadi!**\n\n"
+        result_text += f"📊 **To'g'ri javoblar:** {correct_count}/{len(data['questions'])}\n"
+        result_text += f"⏱ **Sarflangan vaqt:** {time_spent} sekund\n"
+        result_text += f"📈 **Foiz:** {int(correct_count/len(data['questions'])*100)}%\n\n"
+        
+        if wrong_answers:
+            result_text += f"❌ **Xato qilingan savollar ({len(wrong_answers)} ta):**\n\n"
+            for wa in wrong_answers[:10]:  # Faqat 10 tasini ko'rsatish
+                result_text += f"**{wa['num']}.** {wa['question']}\n"
+                result_text += f"   Sizning javobingiz: {wa['user_choice']}\n"
+                result_text += f"   ✅ To'g'ri javob: {wa['correct']}\n\n"
+            if len(wrong_answers) > 10:
+                result_text += f"... va yana {len(wrong_answers)-10} ta xato"
+        
+        await message.answer(result_text, parse_mode="Markdown")
+        
+        # Ma'lumotlar bazasiga saqlash
+        save_personal_result(user_id, data["test_name"], correct_count, time_spent)
+        
+        conn = sqlite3.connect("math_bot.db")
+        c = conn.cursor()
+        c.execute("SELECT first_name, last_name FROM users WHERE user_id=?", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        
+        if row:
+            first_name, last_name = row
+            save_daily_result(user_id, first_name, last_name, correct_count, time_spent)
+        
+        del user_test_data[user_id]
+        await message.answer("Yana test yechish uchun menyudan foydalaning.", reply_markup=main_menu())
+        return
+    
+    # Savolni yuborish
+    q_data = data["questions"][q_index]
+    remaining = len(data["questions"]) - q_index
+    text = f"❓ **Savol {q_index+1}/{len(data['questions'])}**\n"
+    text += f"⏰ Vaqt limiti: 60 soniya\n"
+    text += f"📋 Qolgan savollar: {remaining}\n\n"
+    text += f"{q_data['question']}"
+    
+    try:
+        msg = await message.answer(text, parse_mode="Markdown", reply_markup=option_buttons(q_data["options"]))
+        data["message_id"] = msg.message_id
+        
+        # Taymerni boshlash
+        await cancel_timer(user_id)
+        task = asyncio.create_task(timeout_callback(user_id, message, q_index))
+        user_timer_tasks[user_id] = task
+    except Exception as e:
+        print(f"Xatolik: {e}")
+
 # ==================== FOYDALANUVCHI RO'YXATDAN O'TISH ====================
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(RegisterState.waiting_for_first_name)
-    await message.answer("🤖 Assalomu alaykum! Matematika botiga xush kelibsiz!\n\nIltimos, ismingizni kiriting:")
+    await message.answer(
+        "🤖 **Assalomu alaykum!**\n\n"
+        "🏆 **Matematika botiga xush kelibsiz!**\n\n"
+        "Bu bot sizning matematika bilimingizni oshirish uchun yaratilgan.\n"
+        "📚 30 ta savoldan iborat testlar, ⏰ 60 soniya vaqt limiti!\n\n"
+        "📝 **Iltimos, ismingizni kiriting:**",
+        parse_mode="Markdown"
+    )
 
 @dp.message(RegisterState.waiting_for_first_name)
 async def get_first_name(message: Message, state: FSMContext):
     await state.update_data(first_name=message.text)
     await state.set_state(RegisterState.waiting_for_last_name)
-    await message.answer("Endi familiyangizni kiriting:")
+    await message.answer("📝 Endi familiyangizni kiriting:")
 
 @dp.message(RegisterState.waiting_for_last_name)
 async def get_last_name(message: Message, state: FSMContext):
@@ -384,42 +509,28 @@ async def get_last_name(message: Message, state: FSMContext):
     save_user(message.from_user.id, first_name, last_name)
     await state.clear()
     await message.answer(
-        f"✅ Xush kelibsiz, {first_name} {last_name}!\n\nQuyidagi menyu orqali test yechishni boshlashingiz mumkin:",
+        f"✅ **Xush kelibsiz, {first_name} {last_name}!**\n\n"
+        f"Quyidagi menyu orqali test yechishni boshlashingiz mumkin:\n\n"
+        f"📚 **Testni boshlash** - 30 ta savoldan iborat test\n"
+        f"📊 **Shaxsiy natijalar** - Sizning barcha natijalaringiz\n"
+        f"🏆 **Kunlik reyting** - Bugungi eng yaxshi natijalar\n"
+        f"✏️ **Test qo'shish** - O'zingiz test yaratishingiz\n"
+        f"🎯 **Test to'plamlari** - Boshqalar yaratgan testlar",
+        parse_mode="Markdown",
         reply_markup=main_menu()
     )
 
 # ==================== TEST YECHISH (1-BO'LIM) ====================
 
-async def send_question(message: Message, user_id: int):
-    data = user_test_data[user_id]
-    q_index = data["current_q"]
-    if q_index >= len(data["questions"]):
-        end_time = time.time()
-        time_spent = int(end_time - data["start_time"])
-        correct_count = sum(data["answers"])
-        await message.answer(
-            f"✅ Test tugadi!\n\n📊 To'g'ri javoblar: {correct_count}/{len(data['questions'])}\n⏱ Sarflangan vaqt: {time_spent} sekund"
-        )
-        save_personal_result(user_id, data["test_name"], correct_count, time_spent)
-        conn = sqlite3.connect("math_bot.db")
-        c = conn.cursor()
-        c.execute("SELECT first_name, last_name FROM users WHERE user_id=?", (user_id,))
-        row = c.fetchone()
-        conn.close()
-        if row:
-            first_name, last_name = row
-            save_daily_result(user_id, first_name, last_name, correct_count, time_spent)
-        del user_test_data[user_id]
-        await message.answer("Yana test yechish uchun menyudan foydalaning.", reply_markup=main_menu())
-        return
-    q_data = data["questions"][q_index]
-    text = f"❓ Savol {q_index+1}/{len(data['questions'])}\n⏰ Vaqt: 60 soniya\n\n{q_data['question']}"
-    msg = await message.answer(text, reply_markup=option_buttons(q_data["options"]))
-    data["message_id"] = msg.message_id
-
 @dp.message(lambda msg: msg.text == "📚 Testni boshlash")
 async def start_test(message: Message):
     user_id = message.from_user.id
+    
+    # Agar oldingi test mavjud bo'lsa, tozalash
+    if user_id in user_test_data:
+        await cancel_timer(user_id)
+        del user_test_data[user_id]
+    
     questions = generate_standard_questions()
     user_test_data[user_id] = {
         "questions": questions,
@@ -429,28 +540,38 @@ async def start_test(message: Message):
         "message_id": None,
         "test_name": "Standart test"
     }
+    
+    await message.answer("🎯 **Test boshlandi!**\n\n⏰ Har bir savolga 60 soniya vaqtingiz bor.\n✅ Javob berish uchun tugmalardan birini bosing.\n⏰ Javob bermasangiz, avtomatik keyingi savolga o'tadi.\n\n**Omad!** 🍀", parse_mode="Markdown")
     await send_question(message, user_id)
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("ans_"))
 async def handle_answer(callback: CallbackQuery):
     user_id = callback.from_user.id
+    
     if user_id not in user_test_data:
         await callback.answer("Test topilmadi! /start bilan qaytadan boshlang.")
         return
+    
     data = user_test_data[user_id]
     q_index = data["current_q"]
+    
     if q_index >= len(data["questions"]):
-        await callback.answer()
+        await callback.answer("Test allaqachon tugagan!")
         return
+    
     chosen_idx = int(callback.data.split("_")[1])
     is_correct = (chosen_idx == data["questions"][q_index]["correct"])
+    
     data["answers"].append(1 if is_correct else 0)
     data["current_q"] += 1
+    
     await callback.answer("✅ To'g'ri!" if is_correct else "❌ Xato!")
+    
     try:
         await callback.message.delete()
     except:
         pass
+    
     await send_question(callback.message, user_id)
 
 # ==================== SHAXSIY NATIJALAR (2-BO'LIM) ====================
@@ -459,32 +580,53 @@ async def handle_answer(callback: CallbackQuery):
 async def show_personal_results(message: Message):
     user_id = message.from_user.id
     results = get_personal_results(user_id)
+    
     if not results:
-        await message.answer("❌ Siz hali hech qanday test yechmagansiz.")
+        await message.answer(
+            "❌ **Siz hali hech qanday test yechmagansiz!**\n\n"
+            "📚 Test yechish uchun 'Testni boshlash' tugmasini bosing.",
+            parse_mode="Markdown"
+        )
         return
+    
     text = "📊 **SIZNING SHAXSIY NATIJALARINGIZ**\n\n"
-    for test_name, correct, time_spent, date in results[:10]:
-        text += f"📅 {date[:10]}\n📚 {test_name}\n✅ To'g'ri: {correct} ta\n⏱ Vaqt: {time_spent} sek\n\n"
+    for i, (test_name, correct, time_spent, date) in enumerate(results, 1):
+        text += f"**{i}.** 📅 {date[:10]}\n"
+        text += f"   📚 {test_name}\n"
+        text += f"   ✅ To'g'ri: {correct} ta\n"
+        text += f"   ⏱ Vaqt: {time_spent} sek\n\n"
+    
     text += "\n🗑 **Natijalarni tozalash** uchun /clear_results yuboring."
+    
     await message.answer(text, parse_mode="Markdown")
 
 @dp.message(Command("clear_results"))
 async def clear_results(message: Message):
     user_id = message.from_user.id
     clear_personal_results(user_id)
-    await message.answer("✅ Sizning barcha shaxsiy natijalaringiz tozalandi!")
+    await message.answer("✅ **Sizning barcha shaxsiy natijalaringiz tozalandi!**", parse_mode="Markdown")
 
 # ==================== KUNLIK REYTING (3-BO'LIM) ====================
 
 @dp.message(lambda msg: msg.text == "🏆 Kunlik reyting")
 async def show_daily_ranking(message: Message):
     ranking = get_daily_ranking()
+    
     if not ranking:
-        await message.answer("❌ Bugun hali hech kim test yechmagan.")
+        await message.answer(
+            "❌ **Bugun hali hech kim test yechmagan!**\n\n"
+            "🏆 Birinchi bo'lish uchun test yeching!",
+            parse_mode="Markdown"
+        )
         return
+    
     text = "🏆 **BUGUNGI KUNNING ENG YAXSHI NATIJALARI** 🏆\n\n"
     for idx, (first_name, last_name, correct, time_spent) in enumerate(ranking[:20], 1):
-        text += f"{idx}. {first_name} {last_name} → ✅ {correct} ta ⏱ {time_spent} sek\n"
+        medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"{idx}."
+        text += f"{medal} {first_name} {last_name}\n"
+        text += f"   ✅ {correct} ta to'g'ri\n"
+        text += f"   ⏱ {time_spent} sekund\n\n"
+    
     await message.answer(text, parse_mode="Markdown")
 
 # ==================== TEST QO'SHISH (4-BO'LIM) - HAMMA UCHUN ====================
@@ -492,29 +634,37 @@ async def show_daily_ranking(message: Message):
 @dp.message(lambda msg: msg.text == "✏️ Test qo'shish")
 async def start_add_test(message: Message, state: FSMContext):
     await state.set_state(AddTestState.waiting_for_collection_name)
-    await message.answer("📝 Yangi test to'plamiga nom bering (masalan: 'Algebra asoslari'):")
+    await message.answer(
+        "📝 **Yangi test to'plami yaratish**\n\n"
+        "Test to'plamiga nom bering (masalan: 'Algebra asoslari'):",
+        parse_mode="Markdown"
+    )
 
 @dp.message(AddTestState.waiting_for_collection_name)
 async def get_collection_name(message: Message, state: FSMContext):
     await state.update_data(collection_name=message.text, questions=[])
     await state.set_state(AddTestState.waiting_for_question)
-    await message.answer("✏️ 1-savol matnini yozing:")
+    await message.answer("✏️ **1-savol matnini yozing:**", parse_mode="Markdown")
 
 @dp.message(AddTestState.waiting_for_question)
 async def get_question(message: Message, state: FSMContext):
     await state.update_data(current_question=message.text)
     await state.set_state(AddTestState.waiting_for_options)
-    await message.answer("4 ta javob variantini vergul bilan ajratib yozing (masalan: 10, 20, 30, 40):")
+    await message.answer(
+        "📝 **4 ta javob variantini vergul bilan ajratib yozing**\n\n"
+        "Masalan: `10, 20, 30, 40`",
+        parse_mode="Markdown"
+    )
 
 @dp.message(AddTestState.waiting_for_options)
 async def get_options(message: Message, state: FSMContext):
     options = [opt.strip() for opt in message.text.split(",")]
     if len(options) != 4:
-        await message.answer("❌ 4 ta variant kiriting! Vergul bilan ajrating.")
+        await message.answer("❌ **4 ta variant kiriting!** Vergul bilan ajrating.", parse_mode="Markdown")
         return
     await state.update_data(current_options=options)
     await state.set_state(AddTestState.waiting_for_correct_option)
-    await message.answer("To'g'ri javobni raqam bilan tanlang (1-4):")
+    await message.answer("✅ **To'g'ri javobni raqam bilan tanlang (1-4):**", parse_mode="Markdown")
 
 @dp.message(AddTestState.waiting_for_correct_option)
 async def get_correct(message: Message, state: FSMContext):
@@ -523,8 +673,9 @@ async def get_correct(message: Message, state: FSMContext):
         if correct_idx not in range(4):
             raise ValueError
     except:
-        await message.answer("❌ 1 dan 4 gacha raqam kiriting!")
+        await message.answer("❌ **1 dan 4 gacha raqam kiriting!**", parse_mode="Markdown")
         return
+    
     data = await state.get_data()
     question = {
         "question": data["current_question"],
@@ -535,39 +686,75 @@ async def get_correct(message: Message, state: FSMContext):
     questions.append(question)
     await state.update_data(questions=questions)
     await state.set_state(AddTestState.waiting_for_more)
-    await message.answer(f"✅ Savol qo'shildi! Yana savol qo'shasizmi? (ha/yo'q)")
+    await message.answer(
+        f"✅ **Savol qo'shildi!** ({len(questions)} ta savol)\n\n"
+        f"Yana savol qo'shasizmi? (ha/yo'q)",
+        parse_mode="Markdown"
+    )
 
 @dp.message(AddTestState.waiting_for_more)
 async def ask_more(message: Message, state: FSMContext):
-    if message.text.lower() in ["ha", "yes", "y", "haa"]:
+    if message.text.lower() in ["ha", "yes", "y", "haa", "1"]:
         await state.set_state(AddTestState.waiting_for_question)
-        await message.answer("Yangi savol matnini yozing:")
+        await message.answer("✏️ **Yangi savol matnini yozing:**", parse_mode="Markdown")
     else:
         data = await state.get_data()
         name = data["collection_name"]
         questions = data["questions"]
+        
+        if len(questions) == 0:
+            await message.answer("❌ **Hech qanday savol qo'shilmadi!**", parse_mode="Markdown")
+            await state.clear()
+            await message.answer("Asosiy menyu", reply_markup=main_menu())
+            return
+        
         add_test_collection(name, questions)
         await state.clear()
-        await message.answer(f"✅ '{name}' test to'plami muvaffaqiyatli saqlandi!", reply_markup=main_menu())
+        await message.answer(
+            f"✅ **'{name}' test to'plami muvaffaqiyatli saqlandi!**\n\n"
+            f"📚 {len(questions)} ta savol qo'shildi.\n"
+            f"🎯 Endi boshqalar ham bu testni yecha oladi.",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
+        )
 
 # ==================== TEST TO'PLAMLARI (5-BO'LIM) ====================
 
 @dp.message(lambda msg: msg.text == "🎯 Test to'plamlari")
 async def show_test_collections(message: Message):
     collections = get_test_collections()
+    
     if not collections:
-        await message.answer("❌ Hali hech qanday test to'plami mavjud emas.\n✏️ 'Test qo'shish' bo'limidan yangi test yarating.")
+        await message.answer(
+            "❌ **Hali hech qanday test to'plami mavjud emas!**\n\n"
+            "✏️ **'Test qo'shish'** bo'limidan o'zingiz test yarating.",
+            parse_mode="Markdown"
+        )
         return
-    await message.answer("📚 Mavjud test to'plamlari:", reply_markup=custom_tests_list(collections))
+    
+    await message.answer(
+        "📚 **Mavjud test to'plamlari:**\n\n"
+        "Kerakli testni tanlang:",
+        parse_mode="Markdown",
+        reply_markup=custom_tests_list(collections)
+    )
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("start_custom_"))
 async def start_custom_test(callback: CallbackQuery):
     collection_id = int(callback.data.split("_")[2])
     name, questions = get_test_collection_by_id(collection_id)
+    
     if not questions:
         await callback.answer("Test topilmadi!")
         return
+    
     user_id = callback.from_user.id
+    
+    # Agar oldingi test mavjud bo'lsa, tozalash
+    if user_id in user_test_data:
+        await cancel_timer(user_id)
+        del user_test_data[user_id]
+    
     user_test_data[user_id] = {
         "questions": questions,
         "answers": [],
@@ -576,13 +763,25 @@ async def start_custom_test(callback: CallbackQuery):
         "message_id": None,
         "test_name": name
     }
+    
     await callback.message.delete()
+    await callback.message.answer(
+        f"🎯 **Test boshlandi: {name}**\n\n"
+        f"📚 Jami savollar: {len(questions)} ta\n"
+        f"⏰ Har bir savolga 60 soniya vaqt\n\n"
+        f"**Omad!** 🍀",
+        parse_mode="Markdown"
+    )
     await send_question(callback.message, user_id)
 
 @dp.callback_query(lambda c: c.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery):
     await callback.message.delete()
-    await callback.message.answer("Asosiy menyuga qaytdingiz.", reply_markup=main_menu())
+    await callback.message.answer(
+        "🔙 **Asosiy menyuga qaytdingiz.**",
+        parse_mode="Markdown",
+        reply_markup=main_menu()
+    )
 
 # ==================== ADMIN BUYRUQLARI ====================
 
@@ -610,8 +809,8 @@ async def admin_users_count(message: Message):
     
     users = await get_all_users()
     text = f"👥 **BARCHA FOYDALANUVCHILAR** ({len(users)} ta)\n\n"
-    for user_id, first_name, last_name, reg_date in users[:50]:
-        text += f"🆔 {user_id} | {first_name} {last_name} | 📅 {reg_date[:10]}\n"
+    for i, (user_id, first_name, last_name, reg_date) in enumerate(users[:50], 1):
+        text += f"{i}. 🆔 `{user_id}` | {first_name} {last_name} | 📅 {reg_date[:10]}\n"
     if len(users) > 50:
         text += f"\n... va yana {len(users)-50} ta foydalanuvchi"
     await message.answer(text, parse_mode="Markdown")
@@ -642,34 +841,6 @@ async def admin_broadcast(message: Message):
         await asyncio.sleep(0.05)
     
     await status_msg.edit_text(f"✅ Yuborildi: {sent} ta\n❌ Yuborilmadi: {failed} ta")
-
-@dp.message(Command("set_bot_name"))
-async def admin_set_bot_name(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Bu buyruq faqat admin uchun!")
-        return
-    
-    new_name = message.text.replace("/set_bot_name", "").strip()
-    if not new_name:
-        await message.answer("❌ Yangi nom yozing!\nMasalan: /set_bot_name Matematika Boti")
-        return
-    
-    await bot.set_my_name(new_name)
-    await message.answer(f"✅ Bot nomi o'zgartirildi: **{new_name}**", parse_mode="Markdown")
-
-@dp.message(Command("set_bot_desc"))
-async def admin_set_bot_desc(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Bu buyruq faqat admin uchun!")
-        return
-    
-    new_desc = message.text.replace("/set_bot_desc", "").strip()
-    if not new_desc:
-        await message.answer("❌ Yangi tavsif yozing!\nMasalan: /set_bot_desc Matematika o'rganing!")
-        return
-    
-    await bot.set_my_description(new_desc)
-    await message.answer(f"✅ Bot tavsifi o'zgartirildi: {new_desc}")
 
 @dp.message(Command("clear_daily"))
 async def admin_clear_daily(message: Message):
@@ -710,9 +881,7 @@ async def admin_export_users(message: Message):
     for user_id, first_name, last_name, reg_date in users:
         text += f"{user_id},{first_name},{last_name},{reg_date}\n"
     
-    import io
     from aiogram.types import BufferedInputFile
-    
     file_bytes = text.encode('utf-8')
     await message.answer_document(
         BufferedInputFile(file_bytes, filename="users_export.csv"),
